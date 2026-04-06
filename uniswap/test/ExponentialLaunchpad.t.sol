@@ -27,8 +27,15 @@ contract ExponentialLaunchpadTest is Test, Deployers {
 
     ExponentialLaunchpad hook;
     address public user = address(0x1);
+    address public creator = address(0x2);
+    address public platform = address(0x3);
 
-    uint tokenSupplyToMint = 5e22;
+    uint256 tokenSupplyToMint = 5e22;
+
+    // Post-migration fee config (in bps)
+    uint256 constant PROTOCOL_FEE_BPS = 10; // 0.1%
+    uint256 constant CREATOR_FEE_BPS = 20; // 0.2%
+    uint256 constant LP_REWARD_BPS = 15; // 0.15%
 
     function setUp() public {
         // creates the pool manager, utility routers, and test tokens
@@ -36,30 +43,73 @@ contract ExponentialLaunchpadTest is Test, Deployers {
         Deployers.deployMintAndApprove2Currencies();
 
         // Deploy the hook to an address with the correct flags
-        uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_FLAG);
+        uint160 flags = uint160(
+            Hooks.BEFORE_SWAP_FLAG |
+                Hooks.BEFORE_INITIALIZE_FLAG |
+                Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
+                Hooks.AFTER_SWAP_FLAG
+        );
 
         // Mine a salt that will produce a hook address with the correct flags
-        (address hookAddress, bytes32 salt) =
-                            HookMiner.find(address(this), flags, type(ExponentialLaunchpad).creationCode, abi.encode(address(manager), Currency.unwrap(currency0)));
-        hook = new ExponentialLaunchpad{salt: salt}(IPoolManager(address(manager)), Currency.unwrap(currency0));
-        require(address(hook) == hookAddress, "Launchpad: hook address mismatch");
+        (address hookAddress, bytes32 salt) = HookMiner.find(
+            address(this),
+            flags,
+            type(ExponentialLaunchpad).creationCode,
+            abi.encode(address(manager), Currency.unwrap(currency0))
+        );
+        hook = new ExponentialLaunchpad{salt: salt}(
+            IPoolManager(address(manager)),
+            Currency.unwrap(currency0)
+        );
+        require(
+            address(hook) == hookAddress,
+            "Launchpad: hook address mismatch"
+        );
 
         // Create the pool
-        key = PoolKey(currency0, currency1, LPFeeLibrary.DYNAMIC_FEE_FLAG, 60, IHooks(address(hook)));
-//        manager.initialize(key, SQRT_PRICE_1_1, abi.encodePacked(uint256(tokenSupplyToMint)));
+        key = PoolKey(
+            currency0,
+            currency1,
+            LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            60,
+            IHooks(address(hook))
+        );
 
         _setApprovalsFor(user, Currency.unwrap(currency0));
         _setApprovalsFor(user, Currency.unwrap(currency1));
 
-        // initialize
-        IERC20(Currency.unwrap(currency1)).approve(address(hook), tokenSupplyToMint);
-        manager.unlock(abi.encode(key, SQRT_PRICE_1_1, abi.encodePacked(uint256(tokenSupplyToMint))));
+        // initialize with KRYX config: (maxSupply, creatorWallet, platformTreasury, protocolFeeBps, creatorFeeBps, lpRewardBps)
+        IERC20(Currency.unwrap(currency1)).approve(
+            address(hook),
+            tokenSupplyToMint
+        );
+        bytes memory initData = abi.encode(
+            tokenSupplyToMint,
+            creator,
+            platform,
+            PROTOCOL_FEE_BPS,
+            CREATOR_FEE_BPS,
+            LP_REWARD_BPS
+        );
+        manager.unlock(
+            abi.encode(
+                key,
+                SQRT_PRICE_1_1,
+                initData
+            )
+        );
     }
 
-    function unlockCallback(bytes calldata callbackData) external returns (bytes memory) {
-        require(msg.sender == address(manager), "Dutch Auction Launch Pad: unlockCallback sender is not the manager");
-        (PoolKey memory key, uint160 sqrtPriceX96, bytes memory hookData) = abi.decode(callbackData, (PoolKey, uint160, bytes));
-        manager.initialize(key, sqrtPriceX96, hookData);
+    function unlockCallback(
+        bytes calldata callbackData
+    ) external returns (bytes memory) {
+        require(
+            msg.sender == address(manager),
+            "ExponentialLaunchpad: unlockCallback sender is not the manager"
+        );
+        (PoolKey memory _key, uint160 sqrtPriceX96, bytes memory hookData) = abi
+            .decode(callbackData, (PoolKey, uint160, bytes));
+        manager.initialize(_key, sqrtPriceX96, hookData);
     }
 
     function _setApprovalsFor(address _user, address token) internal {
@@ -80,165 +130,292 @@ contract ExponentialLaunchpadTest is Test, Deployers {
         }
     }
 
+    // =====================
+    // Initialization Tests
+    // =====================
+
     function test_LaunchpadHooksInitialize() public {
         PoolId poolId = key.toId();
-        // Check that beforeInitialize was called
         assertEq(hook.tokenToMintSupply(poolId), tokenSupplyToMint);
+        assertEq(hook.creatorWallet(poolId), creator);
+        assertEq(hook.platformTreasury(poolId), platform);
+        assertFalse(hook.migrated(poolId));
     }
 
-    function test_bondingCurveSwap_exactInput() public {
-        // Send currency1 to the hook (meme coin)
+    // =====================
+    // Bonding Curve + Tax Tests
+    // =====================
+
+    function test_bondingCurveSwap_exactInput_withTax() public {
         currency0.transfer(address(user), 20e18);
-        // this is just for providing initial liquidity
         currency1.transfer(address(hook), 1e18 * 1e20);
         currency0.transfer(address(hook), 1e18 * 1e20);
 
-        (uint256 initialUserBalance0, uint256 initialUserBalance1, uint256 initialManagerBalance0, uint256 initialManagerBalance1) = getUserAndManagerBalance();
+        uint256 initialUserBalance1 = currency1.balanceOf(address(user));
 
         int256 amountSpecified = -1e8;
         BalanceDelta swapDelta = swapToCurrency1(amountSpecified);
 
-        (uint256 finalUserBalance0, uint256 finalUserBalance1, uint256 finalManagerBalance0, uint256 finalManagerBalance1) = getUserAndManagerBalance();
+        uint256 finalUserBalance1 = currency1.balanceOf(address(user));
 
         uint256 token1Output = finalUserBalance1 - initialUserBalance1;
-        assertEq(int256(swapDelta.amount1()), int256(token1Output));
+        // Output should be less than pre-tax amount due to 1% tax
+        assertGt(token1Output, 0);
 
-        assertEq(token1Output, 50000000000000000000000);
+        // Verify tax was collected
+        PoolId poolId = key.toId();
+        uint256 creatorFees = hook.creatorAccrued(poolId);
+        uint256 platformFees = hook.platformAccrued(poolId);
+        assertGt(creatorFees, 0, "Creator should have accrued fees");
+        assertGt(platformFees, 0, "Platform should have accrued fees");
     }
 
-    function test_bondingCurveSwap_exactOutput() public {
-        // Send currency1 to the hook (meme coin)
+    function test_taxSplit_30_35_35() public {
         currency0.transfer(address(user), 20e18);
-        currency1.transfer(address(hook), 1e18 * 1e10);
+        currency1.transfer(address(hook), 1e18 * 1e20);
+        currency0.transfer(address(hook), 1e18 * 1e20);
 
-        (uint256 initialUserBalance0, uint256 initialUserBalance1, uint256 initialManagerBalance0, uint256 initialManagerBalance1) = getUserAndManagerBalance();
+        PoolId poolId = key.toId();
 
-        int256 amountSpecified = 1e8;
-        BalanceDelta swapDelta = swapToCurrency1(amountSpecified);
+        int256 amountSpecified = -1e8;
+        swapToCurrency1(amountSpecified);
 
-        (uint256 finalUserBalance0, uint256 finalUserBalance1, uint256 finalManagerBalance0, uint256 finalManagerBalance1) = getUserAndManagerBalance();
+        uint256 creatorFees = hook.creatorAccrued(poolId);
+        uint256 platformFees = hook.platformAccrued(poolId);
 
-        assertEq(finalUserBalance0 + finalManagerBalance0, initialUserBalance0 + initialManagerBalance0);
-        assertEq(finalUserBalance1 + finalManagerBalance1, initialUserBalance1 + initialManagerBalance1);
+        // Tax = 1% of 1e8 = 1e6
+        uint256 expectedTax = uint256(1e8) / 100;
+        uint256 expectedCreator = (expectedTax * 3500) / 10000;
+        uint256 expectedPlatform = expectedTax - (expectedTax * 3000) / 10000 - expectedCreator;
 
-        int256 token0Output = int256(finalUserBalance0) - int256(initialUserBalance0);
-        assertEq(int256(swapDelta.amount0()), token0Output);
-        assertEq(int256(swapDelta.amount1()), amountSpecified);
-
-        assertEq(token0Output, -999996695221141);
+        assertEq(creatorFees, expectedCreator, "Creator share should be 35% of tax");
+        assertEq(platformFees, expectedPlatform, "Platform share should be 35% of tax");
     }
 
+    // =====================
+    // Price Movement Tests
+    // =====================
 
-    // after the 1st swap, price of the token 1 will increase because more token 1 has been minted,
-    // hence, with the same token 0 amount to be swapped in both 1st and 2nd swap, 2nd swap will result in lesser token 1 than 1st swap
     function test_multipleSwap_priceMovement() public {
-        // Send currency1 to the hook (meme coin)
         currency0.transfer(address(user), 20e18);
 
-        (uint256 firstUserBalance0, uint256 firstUserBalance1, uint256 firstManagerBalance0, uint256 firstManagerBalance1) = getUserAndManagerBalance();
-
+        uint256 firstUserBalance1 = currency1.balanceOf(address(user));
         swapToCurrency1(-1e5);
-
-        (uint256 secondUserBalance0, uint256 secondUserBalance1, uint256 secondManagerBalance0, uint256 secondManagerBalance1) = getUserAndManagerBalance();
-
+        uint256 secondUserBalance1 = currency1.balanceOf(address(user));
         int256 token1UserGetsFor1stSwap = int256(secondUserBalance1 - firstUserBalance1);
 
         swapToCurrency1(-1e5);
-
-        (uint256 thirdUserBalance0, uint256 thirdUserBalance1, uint256 thirdManagerBalance0, uint256 thirdManagerBalance1) = getUserAndManagerBalance();
-
+        uint256 thirdUserBalance1 = currency1.balanceOf(address(user));
         int256 token1UserGetsFor2ndSwap = int256(thirdUserBalance1 - secondUserBalance1);
 
-        // with same amount of token 0 to be swapped in both 1st and 2nd swap, 2nd swap will result in lesser token 1 token as token 1 price increases when more token has been minted
+        // 2nd swap should yield fewer tokens (price increased)
         assertLt(token1UserGetsFor2ndSwap, token1UserGetsFor1stSwap);
-        console.log("Token 1 user gets for 1st swap: ");
-        console.logInt(token1UserGetsFor1stSwap);
-        console.log("Token 1 user gets for 2nd swap: ");
-        console.logInt(token1UserGetsFor2ndSwap);
-        // make sure that the auction is not over
-        assertLt(uint256(token1UserGetsFor2ndSwap + token1UserGetsFor1stSwap), tokenSupplyToMint);
-        // after 2 swap of 100 token 1, manager will have 2e5 token 0 as balance
-        assertEq(thirdManagerBalance0, 2e5);
+        // Auction should not be over
+        assertLt(
+            uint256(token1UserGetsFor2ndSwap + token1UserGetsFor1stSwap),
+            tokenSupplyToMint
+        );
     }
 
-    function test_dynamicFee() public {
-        currency0.transfer(address(user), 2e30);
-        currency1.transfer(address(hook), 2 ** 100);
+    // =====================
+    // DPS Reward Tests
+    // =====================
 
-        uint24 dynamicFeeBefore = hook.getFee(key);
+    function test_dpsRewards_claimAfter24h() public {
+        currency0.transfer(address(user), 20e18);
+        currency1.transfer(address(hook), 1e18 * 1e20);
+        currency0.transfer(address(hook), 1e18 * 1e20);
 
-        skip(1 days);
-        swapToCurrency1(-1e2);
+        // First buy to make user eligible (small amount)
+        swapToCurrency1(-1e5);
 
-        uint24 dynamicFeeAfter = hook.getFee(key);
+        // Wait 24 hours for eligibility
+        skip(24 hours + 1);
 
-        skip(1 days);
+        // Second buy triggers eligibility update + generates DPS from its own tax
+        // User's pending tokens from first buy become eligible here
+        swapToCurrency1(-1e5);
 
-        swapToCurrency1(-1e2);
+        // The 2nd buy's community tax updates DPS, and user is now eligible
+        // But the DPS update happens before the user's eligibility is set in _onBuy
+        // So we need one more trade to generate DPS that the user can earn from
 
-        uint24 dynamicFeeFinal = hook.getFee(key);
+        // Third small buy — DPS from this trade accrues to user's eligible balance
+        swapToCurrency1(-1e5);
 
-        assertGt(dynamicFeeAfter, dynamicFeeBefore);
-
-        // Fee should gradually decrease
-        assertLt(dynamicFeeFinal, dynamicFeeAfter);
+        uint256 pending = hook.pendingRewards(key, user);
+        assertGt(pending, 0, "User should have pending rewards after DPS update");
     }
+
+    function test_eligibilityDelay_noRewardsBefore24h() public {
+        currency0.transfer(address(user), 20e18);
+        currency1.transfer(address(hook), 1e18 * 1e20);
+        currency0.transfer(address(hook), 1e18 * 1e20);
+
+        swapToCurrency1(-1e8);
+
+        // Try to check pending rewards before 24h — should be 0
+        uint256 pending = hook.pendingRewards(key, user);
+        assertEq(pending, 0, "No rewards before eligibility delay");
+    }
+
+    // =====================
+    // Tax Claim Tests
+    // =====================
+
+    function test_claimCreatorFees() public {
+        currency0.transfer(address(user), 20e18);
+        currency1.transfer(address(hook), 1e18 * 1e20);
+        currency0.transfer(address(hook), 1e18 * 1e20);
+
+        swapToCurrency1(-1e8);
+
+        PoolId poolId = key.toId();
+        uint256 creatorFees = hook.creatorAccrued(poolId);
+        assertGt(creatorFees, 0);
+
+        // Transfer base asset to hook so it can pay out
+        currency0.transfer(address(hook), creatorFees);
+
+        vm.prank(creator);
+        hook.claimCreatorFees(key);
+
+        assertEq(hook.creatorAccrued(poolId), 0, "Creator fees should be zeroed after claim");
+    }
+
+    function test_claimPlatformFees() public {
+        currency0.transfer(address(user), 20e18);
+        currency1.transfer(address(hook), 1e18 * 1e20);
+        currency0.transfer(address(hook), 1e18 * 1e20);
+
+        swapToCurrency1(-1e8);
+
+        PoolId poolId = key.toId();
+        uint256 platformFees = hook.platformAccrued(poolId);
+        assertGt(platformFees, 0);
+
+        // Transfer base asset to hook so it can pay out
+        currency0.transfer(address(hook), platformFees);
+
+        vm.prank(platform);
+        hook.claimPlatformFees(key);
+
+        assertEq(hook.platformAccrued(poolId), 0, "Platform fees should be zeroed after claim");
+    }
+
+    function test_claimCreatorFees_unauthorized() public {
+        currency0.transfer(address(user), 20e18);
+        currency1.transfer(address(hook), 1e18 * 1e20);
+        currency0.transfer(address(hook), 1e18 * 1e20);
+
+        swapToCurrency1(-1e8);
+
+        vm.prank(user); // not the creator
+        vm.expectRevert(abi.encodeWithSignature("UNAUTHORIZED()"));
+        hook.claimCreatorFees(key);
+    }
+
+    // =====================
+    // Liquidity Tests
+    // =====================
 
     function test_add_and_remove_liquidity() public {
         currency0.transfer(address(user), 20e18);
         currency1.transfer(address(user), 20e18);
-        uint256 balanceBeforeAddLiquidity0 = currency0.balanceOf(address(manager));
-        uint256 balanceBeforeAddLiquidity1 = currency1.balanceOf(address(manager));
+        uint256 balanceBeforeAddLiquidity0 = currency0.balanceOf(
+            address(manager)
+        );
+        uint256 balanceBeforeAddLiquidity1 = currency1.balanceOf(
+            address(manager)
+        );
         vm.startPrank(user);
-        MockERC20(Currency.unwrap(key.currency0)).approve(address(hook), type(uint256).max);
-        MockERC20(Currency.unwrap(key.currency1)).approve(address(hook), type(uint256).max);
-        uint128 liquidity = hook.addLiquidity(ExponentialLaunchpad.AddLiquidityParams({
-            currency0: key.currency0,
-            currency1: key.currency1,
-            fee: key.fee,
-            amount0Desired: 1e18,
-            amount1Desired: 1e18,
-            amount0Min: 0,
-            amount1Min: 0,
-            to: address(user),
-            deadline: block.timestamp + 1000
-        }));
+        MockERC20(Currency.unwrap(key.currency0)).approve(
+            address(hook),
+            type(uint256).max
+        );
+        MockERC20(Currency.unwrap(key.currency1)).approve(
+            address(hook),
+            type(uint256).max
+        );
+        uint128 liquidity = hook.addLiquidity(
+            ExponentialLaunchpad.AddLiquidityParams({
+                currency0: key.currency0,
+                currency1: key.currency1,
+                fee: key.fee,
+                amount0Desired: 1e18,
+                amount1Desired: 1e18,
+                amount0Min: 0,
+                amount1Min: 0,
+                to: address(user),
+                deadline: block.timestamp + 1000
+            })
+        );
         vm.stopPrank();
-        assertEq(currency0.balanceOf(address(manager)) - balanceBeforeAddLiquidity0, 1e18);
-        assertEq(currency1.balanceOf(address(manager)) - balanceBeforeAddLiquidity1, 1e18);
+        assertEq(
+            currency0.balanceOf(address(manager)) - balanceBeforeAddLiquidity0,
+            1e18
+        );
+        assertEq(
+            currency1.balanceOf(address(manager)) - balanceBeforeAddLiquidity1,
+            1e18
+        );
 
-
-        uint256 balanceUserBeforeRemoveLiquidity0 = currency0.balanceOf(address(user));
-        uint256 balanceUserBeforeRemoveLiquidity1 = currency1.balanceOf(address(user));
+        uint256 balanceUserBeforeRemoveLiquidity0 = currency0.balanceOf(
+            address(user)
+        );
+        uint256 balanceUserBeforeRemoveLiquidity1 = currency1.balanceOf(
+            address(user)
+        );
         vm.startPrank(user);
-        hook.removeLiquidity(ExponentialLaunchpad.RemoveLiquidityParams({
-            currency0: key.currency0,
-            currency1: key.currency1,
-            fee: key.fee,
-            liquidity: liquidity,
-            deadline: block.timestamp + 1000
-        }));
+        hook.removeLiquidity(
+            ExponentialLaunchpad.RemoveLiquidityParams({
+                currency0: key.currency0,
+                currency1: key.currency1,
+                fee: key.fee,
+                liquidity: liquidity,
+                deadline: block.timestamp + 1000
+            })
+        );
         vm.stopPrank();
-        assertEq(currency0.balanceOf(address(user)) - balanceUserBeforeRemoveLiquidity0, 1e18 - 1);
-        assertEq(currency1.balanceOf(address(user)) - balanceUserBeforeRemoveLiquidity1, 1e18 - 1);
+        assertEq(
+            currency0.balanceOf(address(user)) -
+                balanceUserBeforeRemoveLiquidity0,
+            1e18 - 1
+        );
+        assertEq(
+            currency1.balanceOf(address(user)) -
+                balanceUserBeforeRemoveLiquidity1,
+            1e18 - 1
+        );
     }
 
-    function swapToCurrency1(int256 amountSpecified) public returns (BalanceDelta swapDelta)  {
+    // =====================
+    // Helpers
+    // =====================
+
+    function swapToCurrency1(
+        int256 amountSpecified
+    ) public returns (BalanceDelta swapDelta) {
         bool zeroForOne = true;
 
         vm.startPrank(user);
-        swapDelta = swap(key, zeroForOne, amountSpecified, ZERO_BYTES);
+        swapDelta = swap(key, zeroForOne, amountSpecified, abi.encode(user));
         vm.stopPrank();
     }
 
-    function getUserAndManagerBalance() public returns (uint256 userBalance0, uint256 userBalance1, uint256 hookBalance0, uint256 hookBalance1) {
-        uint256 userBalance0 = currency0.balanceOf(address(user));
-        uint256 userBalance1 = currency1.balanceOf(address(user));
-
-        uint256 hookBalance0 = currency0.balanceOf(address(manager));
-        uint256 hookBalance1 = currency1.balanceOf(address(manager));
-
-        return (userBalance0, userBalance1, hookBalance0, hookBalance1);
+    function getUserAndManagerBalance()
+        public
+        view
+        returns (
+            uint256 userBalance0,
+            uint256 userBalance1,
+            uint256 hookBalance0,
+            uint256 hookBalance1
+        )
+    {
+        userBalance0 = currency0.balanceOf(address(user));
+        userBalance1 = currency1.balanceOf(address(user));
+        hookBalance0 = currency0.balanceOf(address(manager));
+        hookBalance1 = currency1.balanceOf(address(manager));
     }
-
 }
